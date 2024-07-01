@@ -1,0 +1,6 @@
+{* comments *}
+{( even more comments )}
+
+(assert true)
+
+"Hello, World!"

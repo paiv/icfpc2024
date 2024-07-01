@@ -1,0 +1,5 @@
+(assert true)
+(assert (! false))
+(assert (= true (! false)))
+
+(= true true)
