@@ -159,12 +159,11 @@ enum _ExprType {
     _ExprType_apply1,
     _ExprType_apply2,
     _ExprType_apply3,
+    _ExprType_lambda,
     _ExprType_define,
     _ExprType_assert,
 };
 
-
-struct _NameTable;
 
 struct _Expr {
     enum _ExprType type;
@@ -175,7 +174,6 @@ struct _Expr {
     struct _Expr* expr3;
     int lineno;
     int colno;
-    struct _NameTable* nametable;
 };
 
 
@@ -229,6 +227,13 @@ struct _Name {
 };
 
 
+static void
+name_init(struct _Name* name, const char* s) {
+    *name = {};
+    name->name = s;
+}
+
+
 struct _NameList {
     struct _Name* names;
     size_t names_size;
@@ -243,7 +248,8 @@ struct _NameTable {
     struct _Name* names[_NameTableSizeMax];
     size_t names_size;
     size_t used;
-    struct _NameTableList* storage;
+    struct _NameTableList* table_storage;
+    struct _NameList* name_storage;
 };
 
 
@@ -262,11 +268,23 @@ name_list_init(struct _NameList* list, size_t bufsize, struct _Name* buf) {
 }
 
 
+static struct _Name*
+name_list_push(struct _NameList* list) {
+    if (list->used + 1 >= list->names_size) {
+        fprintf(stderr, "! out of name storage at %zu\n", list->used);
+        abort();
+    }
+    struct _Name* name = &list->names[list->used++];
+    return name;
+}
+
+
 static void
-name_table_init(struct _NameTable* table, struct _NameTableList* storage) {
+name_table_init(struct _NameTable* table, struct _NameTableList* table_storage, struct _NameList* name_storage) {
     table->names_size = sizeof(table->names) / sizeof(table->names[0]);
     table->used = 0;
-    table->storage = storage;
+    table->table_storage = table_storage;
+    table->name_storage = name_storage;
 }
 
 
@@ -274,35 +292,76 @@ static struct _NameTable*
 name_table_list_init(struct _NameTableList* list, size_t bufsize, struct _NameTable* buf) {
     list->tables = buf;
     list->tables_size = bufsize;
-    list->used = 1;
-    struct _NameTable* table = &list->tables[list->used];
-    name_table_init(table, list);
+    list->used = 0;
+    struct _NameTable* table = &list->tables[list->used++];
+    name_table_init(table, list, NULL);
+    return table;
+}
+
+
+static struct _NameTable*
+name_table_list_push(struct _NameTableList* list) {
+    if (list->used + 1 >= list->tables_size) {
+        fprintf(stderr, "! out of name table storage at %zu\n", list->used);
+        abort();
+    }
+    struct _NameTable* table = &list->tables[list->used++];
+    name_table_init(table, list, NULL);
     return table;
 }
 
 
 static struct _NameTable*
 name_table_add_child(struct _NameTable* table) {
-    struct _NameTableList* storage = table->storage;
-    if (storage->used >= storage->tables_size) {
-        fprintf(stderr, "! out of names storage at %zu\n", storage->used);
-        abort();
-    }
-    struct _NameTable* child = &storage->tables[storage->used++];
-    name_table_init(child, storage);
+    struct _NameTable* child = name_table_list_push(table->table_storage);
+    name_table_init(child, table->table_storage, table->name_storage);
+    child->parent = table;
     return child;
 }
 
 
+static struct _Name*
+name_table_put(struct _NameTable* table, const char* name, struct _Expr* expr) {
+    if (table->used + 1 >= table->names_size) {
+        fprintf(stderr, "! out of name storage in the table at %zu\n", table->used);
+        abort();
+    }
+    struct _Name* s = name_list_push(table->name_storage);
+    table->names[table->used++] = s;
+    name_init(s, name);
+    s->expr = expr;
+    return s;
+}
+
+
 static int
-name_table_resolve(struct _NameTable* table, const char* name, struct _Expr** expr) {
+name_table_resolve(struct _NameTable* table, struct _Token* token, struct _Name** resolved) {
+    struct _Name** p = table->names;
+    for (size_t i = 0; i < table->used; ++i, ++p) {
+        struct _Name* s = *p;
+        if (strcmp(s->name, token->value) == 0) {
+            if (s->expr == NULL) {
+                *resolved = s;
+                return 0;
+            }
+            if (s->expr->type == _ExprType_identifier) {
+                int res = name_table_resolve(table, &s->expr->token, resolved);
+                if (res == 0) { return 0; }
+            }
+            *resolved = s;
+            return 0;
+        }
+    }
+    table = table->parent;
+    if (table != NULL) {
+        return name_table_resolve(table, token, resolved);
+    }
+    fprintf(stderr, ":%d:%d: use of undeclared name %s\n", token->lineno, token->colno, token->value);
     return 1;
 }
 
 
 struct _ParserState {
-    FILE* out_file;
-    int out_format;
     int out_asserts;
     int verbose;
     const char* filename;
@@ -313,17 +372,25 @@ struct _ParserState {
     char* token_buf;
     struct _ExprTree expr_tree;
     struct _NameList name_list;
+};
+
+
+struct _WriterState {
+    FILE* file;
+    int out_format;
+    const char* filename;
+    int verbose;
     struct _NameTableList nametable_list;
     struct _NameTable* nametable;
 };
 
 
 static int
-icfp_parser_init(struct _ParserState* context, int oformat) {
+icfp_writer_init(struct _WriterState* context, FILE* file, int oformat) {
+    context->file = file;
     context->out_format = oformat;
     return 0;
 }
-
 
 static int
 _icfp_parser_skip_comment(struct _ParserState* context, FILE* file, struct _Token* token) {
@@ -1015,11 +1082,35 @@ _icfp_write_number(struct _Number* num, FILE* file) {
 
 
 static int
-_icfp_write_expression(struct _Expr* expr, FILE* file) {
-    switch (expr->type) {
-        case _ExprType_identifier:
-            break;
-        case _ExprType_apply1: {
+_icfp_write_expression(struct _WriterState* context, struct _Expr* expr, struct _NameTable* nametable);
+
+
+static int
+_icfp_write_resolved_name(struct _WriterState* context, struct _Name* name, struct _NameTable* nametable) {
+    struct _Expr* expr = name->expr;
+    if (expr == NULL) {
+        int res = fputc('v', context->file);
+        if (res == EOF) { perror(NULL); return 1; }
+        res = fputs(name->name, context->file);
+        if (res == EOF) { perror(NULL); return 1; }
+        return 0;
+    }
+    if (expr->type == _ExprType_identifier) {
+        int res = fputc('v', context->file);
+        if (res == EOF) { perror(NULL); return 1; }
+        res = fputs(expr->token.value, context->file);
+        if (res == EOF) { perror(NULL); return 1; }
+        return 0;
+    }
+    int res = _icfp_write_expression(context, expr, nametable);
+    return res;
+}
+
+
+static int
+_icfp_write_expr_apply1(struct _WriterState* context, struct _Expr* expr, struct _NameTable* nametable) {
+    switch (expr->expr0->type) {
+        case _ExprType_identifier: {
             struct _Token* token = &expr->expr0->token;
             if (token->len == 1) {
                 char c = token->value[0];
@@ -1030,25 +1121,84 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
                     case '$': {
                         char s[4] = "U_ ";
                         s[1] = c;
-                        int res = fputs(s, file);
+                        int res = fputs(s, context->file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        return _icfp_write_expression(expr->expr1, file);
+                        return _icfp_write_expression(context, expr->expr1, nametable);
                     }
                     default:
                         break;
                 }
             }
-            struct _Expr* body;
-            int res = name_table_resolve(expr->nametable, token->value, &body);
+            struct _Name* resolved_name;
+            int res = name_table_resolve(nametable, token, &resolved_name);
             if (res != 0) { return res; }
-            res = fputs("B$ ", file);
+            res = fputs("B$ ", context->file);
             if (res == EOF) { perror(NULL); return 1; }
-            res = _icfp_write_expression(body, file);
+            res = _icfp_write_resolved_name(context, resolved_name, nametable);
             if (res != 0) { return res; }
-            res = fputc(' ', file);
+            res = fputc(' ', context->file);
             if (res == EOF) { perror(NULL); return 1; }
-            return res = _icfp_write_expression(expr->expr1, file);
+            return _icfp_write_expression(context, expr->expr1, nametable);
         }
+        case _ExprType_apply1:
+        case _ExprType_apply2:
+        case _ExprType_apply3: {
+            int res = fputs("B$ ", context->file);
+            if (res == EOF) { perror(NULL); return 1; }
+            res = _icfp_write_expression(context, expr->expr0, nametable);
+            if (res != 0) { return res; }
+            res = fputc(' ', context->file);
+            if (res == EOF) { perror(NULL); return 1; }
+            return _icfp_write_expression(context, expr->expr1, nametable);
+        }
+        case _ExprType_lambda: {
+            int res;
+            struct _Expr* args = expr->expr0->expr1;
+            enum _ExprType arity = args->type;
+            switch (arity) {
+                case _ExprType_apply3:
+                    res = fputs("B$ ", context->file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    // fallthrough
+                case _ExprType_apply2:
+                    res = fputs("B$ ", context->file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    // fallthrough
+                case _ExprType_apply1:
+                    res = fputs("B$ ", context->file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    break;
+                default:
+                    fprintf(stderr, "! invalid lambda arity %d\n", arity);
+                    abort();
+            }
+            res = _icfp_write_expression(context, expr->expr0, nametable);
+            if (res != 0) { return res; }
+            res = fputc(' ', context->file);
+            if (res == EOF) { perror(NULL); return 1; }
+            return _icfp_write_expression(context, expr->expr1, nametable);
+        }
+        default:
+            fprintf(stderr, "! invalid expression to apply %d\n", expr->expr0->type);
+            abort();
+    }
+}
+
+
+static int
+_icfp_write_expression(struct _WriterState* context, struct _Expr* expr, struct _NameTable* nametable) {
+    FILE* file = context->file;
+    switch (expr->type) {
+        case _ExprType_identifier: {
+            struct _Name* resolved_name;
+            int res = name_table_resolve(nametable, &expr->token, &resolved_name);
+            if (res != 0) { return res; }
+            res = _icfp_write_resolved_name(context, resolved_name, nametable);
+            if (res != 0) { return res; }
+            return 0;
+        }
+        case _ExprType_apply1:
+            return _icfp_write_expr_apply1(context, expr, nametable);
         case _ExprType_apply2: {
             struct _Token* token = &expr->expr0->token;
             if (token->len == 1) {
@@ -1072,32 +1222,32 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
                         s[1] = c;
                         int res = fputs(s, file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        res = _icfp_write_expression(expr->expr1, file);
+                        res = _icfp_write_expression(context, expr->expr1, nametable);
                         if (res != 0) { return res; }
                         res = fputc(' ', file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        return _icfp_write_expression(expr->expr2, file);
+                        return _icfp_write_expression(context, expr->expr2, nametable);
                     }
                     default:
                         break;
                 }
             }
-            struct _Expr* body;
-            int res = name_table_resolve(expr->nametable, token->value, &body);
+            struct _Name* resolved_name;
+            int res = name_table_resolve(nametable, token, &resolved_name);
             if (res != 0) { return res; }
             res = fputs("B$ ", file);
             if (res == EOF) { perror(NULL); return 1; }
             res = fputs("B$ ", file);
             if (res == EOF) { perror(NULL); return 1; }
-            res = _icfp_write_expression(body, file);
+            res = _icfp_write_resolved_name(context, resolved_name, nametable);
             if (res != 0) { return res; }
             res = fputc(' ', file);
             if (res == EOF) { perror(NULL); return 1; }
-            res = _icfp_write_expression(expr->expr1, file);
+            res = _icfp_write_expression(context, expr->expr1, nametable);
             if (res != 0) { return res; }
             res = fputc(' ', file);
             if (res == EOF) { perror(NULL); return 1; }
-            return res = _icfp_write_expression(expr->expr2, file);
+            return _icfp_write_expression(context, expr->expr2, nametable);
         }
         case _ExprType_apply3: {
             struct _Token* token = &expr->expr0->token;
@@ -1109,15 +1259,15 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
                         if (res == EOF) { perror(NULL); return 1; }
                         res = fputc(' ', file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        res = _icfp_write_expression(expr->expr1, file);
+                        res = _icfp_write_expression(context, expr->expr1, nametable);
                         if (res != 0) { return res; }
                         res = fputc(' ', file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        res = _icfp_write_expression(expr->expr2, file);
+                        res = _icfp_write_expression(context, expr->expr2, nametable);
                         if (res != 0) { return res; }
                         res = fputc(' ', file);
                         if (res == EOF) { perror(NULL); return 1; }
-                        return _icfp_write_expression(expr->expr3, file);
+                        return _icfp_write_expression(context, expr->expr3, nametable);
                     }
                     default:
                         break;
@@ -1125,6 +1275,45 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
             }
             fprintf(stderr, "! apply3 not implemented\n");
             abort();
+        }
+        case _ExprType_lambda: {
+            struct _Expr* args = expr->expr1;
+            enum _ExprType arity = args->type;
+            struct _NameTable* body_nametable = name_table_add_child(nametable);
+            switch (arity) {
+                case _ExprType_apply1: {
+                    int res = fputc('L', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputs(args->expr1->token.value, file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputc(' ', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    name_table_put(body_nametable, args->expr1->token.value, NULL);
+                    break;
+                }
+                case _ExprType_apply2: {
+                    int res = fputc('L', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputs(args->expr1->token.value, file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputc(' ', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    name_table_put(body_nametable, args->expr1->token.value, NULL);
+
+                    res = fputc('L', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputs(args->expr2->token.value, file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    res = fputc(' ', file);
+                    if (res == EOF) { perror(NULL); return 1; }
+                    name_table_put(body_nametable, args->expr2->token.value, NULL);
+                    break;
+                }
+                default:
+                    fprintf(stderr, "unhandled lambda arity %d\n", arity);
+                    abort();
+            }
+            return _icfp_write_expression(context, expr->expr2, body_nametable);
         }
         case _ExprType_literal:
             switch (expr->token.type) {
@@ -1157,7 +1346,7 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
                 perror(NULL);
                 return 1;
             }
-            return _icfp_write_expression(expr->expr1, file);
+            return _icfp_write_expression(context, expr->expr1, nametable);
         }
         case _ExprType_define:
         case _ExprType_invalid:
@@ -1171,16 +1360,62 @@ _icfp_write_expression(struct _Expr* expr, FILE* file) {
 struct _Nesting {
     int level;
     int popped;
-    struct _NameTable* nametable;
 };
 
+
+static void
+dump_arg_list(struct _Expr* expr, FILE* file) {
+    switch (expr->type) {
+        case _ExprType_apply1:
+            fputc('(', file);
+            if (expr->expr0->type == _ExprType_identifier) {
+                fputs(expr->expr0->token.value, file);
+                fputc(' ', file);
+            }
+            fputs(expr->expr1->token.value, file);
+            fputc(')', file);
+            break;
+        case _ExprType_apply2:
+            fputc('(', file);
+            if (expr->expr0->type == _ExprType_identifier) {
+                fputs(expr->expr0->token.value, file);
+                fputc(' ', file);
+            }
+            fputs(expr->expr1->token.value, file);
+            fputc(' ', file);
+            fputs(expr->expr2->token.value, file);
+            fputc(')', file);
+            break;
+        case _ExprType_apply3:
+            fputc('(', file);
+            if (expr->expr0->type == _ExprType_identifier) {
+                fputs(expr->expr0->token.value, file);
+                fputc(' ', file);
+            }
+            fputs(expr->expr1->token.value, file);
+            fputc(' ', file);
+            fputs(expr->expr2->token.value, file);
+            fputc(' ', file);
+            fputs(expr->expr3->token.value, file);
+            fputc(')', file);
+            break;
+        case _ExprType_identifier:
+        case _ExprType_literal:
+        case _ExprType_lambda:
+        case _ExprType_define:
+        case _ExprType_assert:
+        case _ExprType_invalid:
+            fprintf(file, "expr:err%d", expr->type);
+            break;
+    }
+}
 
 
 static void
 dump_expr(struct _Expr* expr, FILE* file) {
     switch (expr->type) {
         case _ExprType_invalid:
-            fprintf(file, "expr:err");
+            fprintf(file, "expr:err%d", expr->type);
             break;
         case _ExprType_identifier:
             fprintf(file, "expr:id %s", expr->token.value);
@@ -1198,7 +1433,6 @@ dump_expr(struct _Expr* expr, FILE* file) {
             fputc(')', file);
             break;
         case _ExprType_apply2:
-        case _ExprType_define:
             fprintf(file, "expr:apply (");
             dump_expr(expr->expr0, file);
             fputc(')', file);
@@ -1228,6 +1462,22 @@ dump_expr(struct _Expr* expr, FILE* file) {
             dump_expr(expr->expr3, file);
             fputc(')', file);
             break;
+        case _ExprType_lambda:
+            fprintf(file, "expr:lambda ");
+            dump_arg_list(expr->expr1, file);
+            fputc(' ', file);
+            fputc('(', file);
+            dump_expr(expr->expr2, file);
+            fputc(')', file);
+            break;
+        case _ExprType_define:
+            fprintf(file, "expr:define ");
+            dump_arg_list(expr->expr1, file);
+            fputc(' ', file);
+            fputc('(', file);
+            dump_expr(expr->expr2, file);
+            fputc(')', file);
+            break;
         case _ExprType_assert:
             fprintf(file, "expr:assert (");
             dump_expr(expr->expr0, file);
@@ -1247,8 +1497,8 @@ _icfp_parser_parse_expression(struct _ParserState* context, FILE* file,
 
 
 static int
-_icfp_parser_parse_lambda(struct _ParserState* context, FILE* file,
-    struct _Nesting* nesting, struct _Expr* expr) {
+_icfp_parser_parse_arg_list(struct _ParserState* context, FILE* file,
+    struct _Nesting* nesting, int minargs, struct _Expr** expr) {
 
     struct _Token token;
     struct _Expr* args;
@@ -1268,79 +1518,96 @@ _icfp_parser_parse_lambda(struct _ParserState* context, FILE* file,
                         args->token = token;
                         args->lineno = token.lineno;
                         args->colno = token.colno;
-                        args->nametable = nesting->nametable;
-                        expr->expr1 = args;
+                        args->expr0 = expr_tree_push(&context->expr_tree);
                         state = 1;
                         break;
                     default:
                         fprintf(stderr, "%s:%d:%d: expecting an argument list\n", context->filename, token.lineno, token.colno);
                         return 1;
                 }
+                break;
             case 1:
                 switch (token.type) {
                     case _TokenType_identifier:
                         nested = expr_tree_push(&context->expr_tree);
+                        nested->type = _ExprType_identifier;
                         nested->token = token;
                         nested->lineno = token.lineno;
                         nested->colno = token.colno;
-                        nested->nametable = nesting->nametable;
-                        args->type = _ExprType_apply1;
                         args->expr1 = nested;
                         state = 2;
                         break;
+                    case _TokenType_close_paren:
+                        if (minargs > 0) {
+                            fprintf(stderr, "%s:%d:%d: expecting an identifier\n", context->filename, token.lineno, token.colno);
+                            return 1;
+                        }
+                        *expr = args;
+                        fprintf(stderr, "%s:%d:%d: empty arg list\n", context->filename, token.lineno, token.colno);
+                        abort();
+                        return 0;
                     default:
                         fprintf(stderr, "%s:%d:%d: expecting an identifier\n", context->filename, token.lineno, token.colno);
                         return 1;
                 }
+                break;
             case 2:
                 switch (token.type) {
                     case _TokenType_identifier:
                         nested = expr_tree_push(&context->expr_tree);
+                        nested->type = _ExprType_identifier;
                         nested->token = token;
                         nested->lineno = token.lineno;
                         nested->colno = token.colno;
-                        nested->nametable = nesting->nametable;
-                        args->type = _ExprType_apply2;
+                        args->type = _ExprType_apply1;
                         args->expr2 = nested;
                         state = 3;
                         break;
                     case _TokenType_close_paren:
-                        state = 10;
-                        break;
+                        if (minargs > 1) {
+                            fprintf(stderr, "%s:%d:%d: expecting an identifier\n", context->filename, token.lineno, token.colno);
+                            return 1;
+                        }
+                        args->type = _ExprType_apply1;
+                        *expr = args;
+                        return 0;
                     default:
                         fprintf(stderr, "%s:%d:%d: expecting an identifier\n", context->filename, token.lineno, token.colno);
                         return 1;
                 }
+                break;
             case 3:
                 switch (token.type) {
-                    case _TokenType_close_paren:
-                        state = 10;
+                    case _TokenType_identifier:
+                        nested = expr_tree_push(&context->expr_tree);
+                        nested->type = _ExprType_identifier;
+                        nested->token = token;
+                        nested->lineno = token.lineno;
+                        nested->colno = token.colno;
+                        args->type = _ExprType_apply2;
+                        args->expr3 = nested;
+                        state = 3;
                         break;
+                    case _TokenType_close_paren:
+                        args->type = _ExprType_apply2;
+                        *expr = args;
+                        return 0;
                     default:
-                        fprintf(stderr, "%s:%d:%d: expecting a closing paren\n", context->filename, token.lineno, token.colno);
+                        fprintf(stderr, "%s:%d:%d: expecting an identifier\n", context->filename, token.lineno, token.colno);
                         return 1;
                 }
-            case 10: {
-                    struct _Nesting deeper = {};
-                    deeper.nametable = nesting->nametable;
-                    int res = _icfp_parser_parse_expression(context, file, &deeper, &nested);
-                    if (res == 0) {
-                        fprintf(stderr, "%s:%d:%d: expecting expression\n", context->filename, context->lineno, context->colno);
-                        return 1;
-                    }
-                    if (res != 1) { return 1; }
-                    expr->expr2 = nested;
-                    state = 11;
-                    break;
-            }
-            case 11:
+                break;
+            case 4:
                 switch (token.type) {
                     case _TokenType_close_paren:
+                        args->type = _ExprType_apply3;
+                        *expr = args;
                         return 0;
                     default:
                         fprintf(stderr, "%s:%d:%d: expecting a closing paren\n", context->filename, token.lineno, token.colno);
                         return 1;
                 }
+                break;
         }
     }
     abort();
@@ -1348,10 +1615,92 @@ _icfp_parser_parse_lambda(struct _ParserState* context, FILE* file,
 
 
 static int
+_icfp_parser_parse_lambda(struct _ParserState* context, FILE* file,
+    struct _Nesting* nesting, struct _Expr* expr) {
+
+    struct _Expr* nested;
+    struct _Expr* args;
+    int minargs = 1;
+    int res = _icfp_parser_parse_arg_list(context, file, nesting, minargs, &args);
+    if (res != 0) { return res; }
+
+    expr->expr1 = args;
+
+    struct _Nesting deeper = {};
+    res = _icfp_parser_parse_expression(context, file, &deeper, &nested);
+    if (res == 0) {
+        fprintf(stderr, "%s:%d:%d: expecting expression\n", context->filename, context->lineno, context->colno);
+        return 1;
+    }
+    if (res != 1) { return 1; }
+    expr->expr2 = nested;
+
+    struct _Token token;
+    res = _icfp_parser_tokenize(context, file, &token);
+    if (res != 0) { return -1; }
+    if (context->verbose) {
+        fprintf(stderr, "%s:%d:%d: token %d %s\n", context->filename, token.lineno, token.colno, token.type, token.value);
+    }
+    switch (token.type) {
+        case _TokenType_close_paren:
+            expr->type = _ExprType_lambda;
+            return 0;
+        default:
+            fprintf(stderr, "%s:%d:%d: expecting a closing paren\n", context->filename, token.lineno, token.colno);
+            return 1;
+    }
+}
+
+
+static int
 _icfp_parser_parse_define(struct _ParserState* context, FILE* file,
     struct _Nesting* nesting, struct _Expr* expr) {
 
-    return 1;
+    struct _Expr* nested;
+    struct _Expr* args;
+    int minargs = 2;
+    int res = _icfp_parser_parse_arg_list(context, file, nesting, minargs, &args);
+    if (res != 0) { return res; }
+
+    args->expr0 = args->expr1;
+    args->expr1 = args->expr2;
+    args->expr2 = args->expr3;
+    args->expr3 = NULL;
+    switch (args->type) {
+        case _ExprType_apply2:
+            args->type = _ExprType_apply1;
+            break;
+        case _ExprType_apply3:
+            args->type = _ExprType_apply2;
+            break;
+        default:
+            abort();
+    }
+    expr->expr1 = args;
+
+    struct _Nesting deeper = {};
+    res = _icfp_parser_parse_expression(context, file, &deeper, &nested);
+    if (res == 0) {
+        fprintf(stderr, "%s:%d:%d: expecting expression\n", context->filename, context->lineno, context->colno);
+        return 1;
+    }
+    if (res != 1) { return 1; }
+    expr->expr2 = nested;
+
+    struct _Token token;
+    res = _icfp_parser_tokenize(context, file, &token);
+    if (res != 0) { return -1; }
+    if (context->verbose) {
+        fprintf(stderr, "%s:%d:%d: token %d %s\n", context->filename, token.lineno, token.colno, token.type, token.value);
+    }
+    switch (token.type) {
+        case _TokenType_close_paren:
+            expr->type = _ExprType_define;
+            return 0;
+        default:
+            fprintf(stderr, "%s:%d:%d: expecting a closing paren\n", context->filename, token.lineno, token.colno);
+            return 1;
+    }
 }
 
 
@@ -1380,6 +1729,7 @@ _icfp_parser_parse_expression_body(struct _ParserState* context, FILE* file,
         case _ExprType_apply1:
         case _ExprType_apply2:
         case _ExprType_apply3:
+        case _ExprType_lambda:
             expr->expr0 = nested;
             break;
         case _ExprType_literal:
@@ -1403,6 +1753,7 @@ _icfp_parser_parse_expression_body(struct _ParserState* context, FILE* file,
         case _ExprType_apply2:
         case _ExprType_apply3:
         case _ExprType_literal:
+        case _ExprType_lambda:
             expr->expr1 = nested;
             break;
         case _ExprType_define:
@@ -1430,6 +1781,7 @@ _icfp_parser_parse_expression_body(struct _ParserState* context, FILE* file,
         case _ExprType_literal:
             expr->expr2 = nested;
             break;
+        case _ExprType_lambda:
         case _ExprType_define:
         case _ExprType_assert:
         case _ExprType_invalid:
@@ -1455,6 +1807,7 @@ _icfp_parser_parse_expression_body(struct _ParserState* context, FILE* file,
         case _ExprType_literal:
             expr->expr3 = nested;
             break;
+        case _ExprType_lambda:
         case _ExprType_define:
         case _ExprType_assert:
         case _ExprType_invalid:
@@ -1494,14 +1847,12 @@ _icfp_parser_parse_expression(struct _ParserState* context, FILE* file,
     }
     switch (token.type) {
         case _TokenType_open_paren: {
-            struct _Nesting deeper = {0};
+            struct _Nesting deeper = {};
             deeper.level = nesting->level + 1;
-            deeper.nametable = nesting->nametable;
             struct _Expr* expr = expr_tree_push(&context->expr_tree);
             expr->token = token;
             expr->lineno = token.lineno;
             expr->colno = token.colno;
-            expr->nametable = nesting->nametable;
             int res = _icfp_parser_parse_expression_body(context, file, &deeper, expr);
             if (res != 0) { return -1; }
             *parsed_expr = expr;
@@ -1528,7 +1879,6 @@ _icfp_parser_parse_expression(struct _ParserState* context, FILE* file,
             expr->token = token;
             expr->lineno = token.lineno;
             expr->colno = token.colno;
-            expr->nametable = nesting->nametable;
             *parsed_expr = expr;
             if (context->verbose) {
                 _icfp_parser_log_expr(context, expr, stderr);
@@ -1542,7 +1892,6 @@ _icfp_parser_parse_expression(struct _ParserState* context, FILE* file,
             expr->token = token;
             expr->lineno = token.lineno;
             expr->colno = token.colno;
-            expr->nametable = nesting->nametable;
             *parsed_expr = expr;
             if (context->verbose) {
                 _icfp_parser_log_expr(context, expr, stderr);
@@ -1566,32 +1915,56 @@ _icfp_parser_parse_expression(struct _ParserState* context, FILE* file,
 
 
 static int
-icfp_parser_filter_to_text(struct _ParserState* context, FILE* file) {
+icfp_parser_process(struct _ParserState* context, struct _WriterState* wstate, const char* filename, FILE* file) {
+    context->filename = filename;
+    context->lineno = 1;
+    context->colno = 1;
+    switch (wstate->out_format) {
+        case 1:
+            break;
+        default:
+            fprintf(stderr, "! unhandled output format %d\n", wstate->out_format);
+            return 1;
+    }
+
     struct _Expr* expr;
     int count = 0;
     for (;;) {
         if (count > 0) {
-            fputc('\n', context->out_file);
+            fputc('\n', wstate->file);
         }
         struct _Nesting nesting = {};
-        nesting.nametable = context->nametable;
         int res = _icfp_parser_parse_expression(context, file, &nesting, &expr);
         if (res != 1) { return res; }
         switch (expr->type) {
-            case _ExprType_literal: {
+            case _ExprType_literal:
             case _ExprType_apply1:
             case _ExprType_apply2:
             case _ExprType_apply3:
-                int res = _icfp_write_expression(expr, context->out_file);
+            case _ExprType_lambda: {
+                int res = _icfp_write_expression(wstate, expr, wstate->nametable);
                 if (res != 0) { return res; }
                 ++count;
                 break;
             }
-            case _ExprType_define:
+            case _ExprType_define: {
+                struct _Expr* args = expr->expr1;
+                struct _Expr* body = expr->expr2;
+                const char* name = args->expr0->token.value;
+                struct _Expr* lamb = expr_tree_push(&context->expr_tree);
+                lamb->type = _ExprType_lambda;
+                lamb->token = expr->token;
+                lamb->lineno = expr->token.lineno;
+                lamb->colno = expr->token.colno;
+                lamb->expr0 = args->expr0;
+                lamb->expr1 = args;
+                lamb->expr2 = body;
+                name_table_put(wstate->nametable, name, lamb);
                 break;
+            }
             case _ExprType_assert:
                 if (context->out_asserts != 0) {
-                    int res = _icfp_write_expression(expr, context->out_file);
+                    int res = _icfp_write_expression(wstate, expr, wstate->nametable);
                     if (res != 0) { return res; }
                     ++count;
                 }
@@ -1603,21 +1976,6 @@ icfp_parser_filter_to_text(struct _ParserState* context, FILE* file) {
         }
     }
     return 0;
-}
-
-
-static int
-icfp_parser_process(struct _ParserState* context, const char* filename, FILE* file) {
-    context->filename = filename;
-    context->lineno = 1;
-    context->colno = 1;
-    switch (context->out_format) {
-        case 1:
-            return icfp_parser_filter_to_text(context, file);
-        default:
-            fprintf(stderr, "! unhandled output format %d\n", context->out_format);
-            return 1;
-    }
 }
 
 
@@ -1709,20 +2067,22 @@ int main(int argc, const char* argv[]) {
     int res = _parse_args(argc, argv, &config);
     if (res != 0) { return res; }
 
-    static char symbs[_SymbolBufSizeMax];
-    size_t symb_size = sizeof(symbs);
+    FILE* out_file = stdout;
 
-    static struct _Expr exprs[_ExprTreeSizeMax];
-    size_t expr_size = sizeof(exprs) / sizeof(exprs[0]);
+    char* symbs = (char*) calloc(_SymbolBufSizeMax, sizeof(char));
+    size_t symb_size = _SymbolBufSizeMax;
 
-    static char token_buf[_TokenSizeMax];
-    size_t token_bufsize = sizeof(token_buf);
+    struct _Expr* exprs = (struct _Expr*) calloc(_ExprTreeSizeMax, sizeof(_Expr));
+    size_t expr_size = _ExprTreeSizeMax;
 
-    static _Name names_buf[_NamesSizeMax];
-    size_t names_bufsize = sizeof(names_buf) / sizeof(names_buf[0]);
+    char* token_buf = (char*) calloc(_TokenSizeMax, sizeof(char));
+    size_t token_bufsize = _TokenSizeMax;
 
-    struct _NameTable name_tables[_NameTableListSizeMax];
-    size_t name_tables_size = sizeof(name_tables) / sizeof(name_tables[0]);
+    struct _Name* names_buf = (struct _Name*) calloc(_NamesSizeMax, sizeof(_Name));
+    size_t names_bufsize = _NamesSizeMax;
+
+    struct _NameTable* name_tables = (struct _NameTable*) calloc(_NameTableListSizeMax, sizeof(_NameTable));
+    size_t name_tables_size = _NameTableListSizeMax;
     struct _NameTable* root_nametable;
 
     struct _ParserState pstate;
@@ -1731,15 +2091,19 @@ int main(int argc, const char* argv[]) {
     symbol_list_init(&pstate.symbols, symb_size, symbs);
     expr_tree_init(&pstate.expr_tree, expr_size, exprs);
     name_list_init(&pstate.name_list, names_bufsize, names_buf);
-    root_nametable = name_table_list_init(&pstate.nametable_list, name_tables_size, name_tables);
-    pstate.nametable = root_nametable;
-    pstate.out_file = stdout;
     pstate.verbose = config.verbose;
     pstate.out_asserts = config.out_asserts;
-    res = icfp_parser_init(&pstate, config.out_text);
-    if (res != 0) { return res; }
 
     _icfp_parser_init_symbols(&pstate);
+
+    struct _WriterState wstate;
+    res = icfp_writer_init(&wstate, out_file, config.out_text);
+    if (res != 0) { return res; }
+    wstate.filename = NULL;
+    wstate.verbose = config.verbose;
+    root_nametable = name_table_list_init(&wstate.nametable_list, name_tables_size, name_tables);
+    root_nametable->name_storage = &pstate.name_list;
+    wstate.nametable = root_nametable;
 
     for (int fni = 0; fni < config.filename_count; ++fni) {
         const char* filename = config.filenames[fni];
@@ -1761,7 +2125,7 @@ int main(int argc, const char* argv[]) {
             fprintf(stderr, "procesing %s\n", filename);
         }
 
-        res = icfp_parser_process(&pstate, filename, fp);
+        res = icfp_parser_process(&pstate, &wstate, filename, fp);
         if (res != 0) { return res; }
 
         if (fp != stdin) {

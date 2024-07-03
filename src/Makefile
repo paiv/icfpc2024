@@ -6,16 +6,18 @@ CPPFLAGS = -std=c++17 -O2 -Wall -Wno-unused-function -ftrapv
 all: icfpc
 
 .PHONY: debug
-debug: CPPFLAGS += -Og -g -DDEBUG
+debug: CPPFLAGS += -O0 -g -DDEBUG
 debug: LDFLAGS += -g
 debug: all
+
+.PHONY: sanitize
+sanitize: CPPFLAGS += -fsanitize=address
+sanitize: LDFLAGS += -fsanitize=address
+sanitize: all
 
 icfpc: icfpc.o
 icfpc.o: icfpc.cpp
 
-solve_lambdaman: solve_lambdaman.o
-solve_lambdaman.o: solve_lambdaman.cpp
-
 .PHONY: clean
 clean:
-	rm -rf *.o icfpc solve_lambdaman
+	rm -rf *.o *.dSYM icfpc
