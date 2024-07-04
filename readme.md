@@ -9,6 +9,7 @@ ICFP compiler
 --
 Compiles toy ICF language in the style of:
 ```scheme
+{- combinator -}
 (define (Y f) (
   (\ (x) (f (x x)))
   (\ (x) (f (x x)))
